@@ -29,6 +29,15 @@ int32_t DecodePktToFrame(AVCodecContext* pDecodeCtx, AVPacket* pInPacket, AVFram
 void showPacketInfo(const AVFrame* avFrame, bool isVideo);
 int32_t VideoConvert(const AVFrame* pInFrame, AVPixelFormat eOutFormat, int32_t nOutWidth, int32_t nOutHeight, AVFrame** ppOutFrame);
 int32_t AudioConvert(const AVFrame* pInFrame, AVSampleFormat eOutSmplFmt, int32_t nOutChannels, int32_t nOutSmplRate, AVFrame** ppOutFrame);
+int32_t VidEncoderOpen(
+	AVPixelFormat	ePxlFormat,			// 输入图像像素格式
+	int32_t			nFrameWidth,		// 输入图像宽度
+	int32_t			nFrameHeight,		// 输入图像高度
+	int32_t			nFrameRate,			// 编码帧率
+	float			nBitRateFactor);	// 转码因子，通常设为 0.8~8
+void VidEncoderClose();
+int32_t VidEncoderEncPacket(AVFrame* pInFrame, AVPacket** ppOutPacket);
+
 
 int main()
 {
@@ -344,12 +353,12 @@ int32_t DecodePktToFrame(
 	if (res == AVERROR(EAGAIN))	// 没有数据送入，但是可以继续从内部缓存区读取编码后的音视频数据
 	{
 		std::cout << "<DecodePktFrame> avcodec_send_packet() EAGAIN" << std::endl;
-		return EAGAIN;
+		//return EAGAIN;
 	}
 	else if (res == AVERROR_EOF) // 内部缓冲区中数据全部解码完成，不再有解码后的帧数据输出
 	{
 		std::cout << "<DecodePktFrame> avocodec_send_packet() AVERROR_EOF" << std::endl;
-		return AVERROR_EOF;
+		//return AVERROR_EOF;
 	}
 	else if (res < 0)
 	{
@@ -475,7 +484,7 @@ int32_t AudioConvert(
 		std::cout << "AudioConvert> [ERROR] fail to swr_alloc" << std::endl;
 		return -1;
 	}
-	
+
 	swr_alloc_set_opts(pSwrCtx, nOutChnlLayout, eOutSmplFmt, nOutSmplRate,
 		nInChnlLayout, (enum AVSampleFormat)(pInFrame->format), pInFrame->sample_rate, 0, nullptr);
 
@@ -518,10 +527,121 @@ int32_t AudioConvert(
 	return 0;
 }
 
+AVCodecContext* m_pVideoEncCtx = nullptr; // 视频编码器上下文
 
+// 根据图像格式和信息来创建编码器
+int32_t VidEncoderOpen(
+	AVPixelFormat	ePxlFormat,		// 输入图像像素格式
+	int32_t			nFrameWidth,	// 输入图像宽度
+	int32_t			nFrameHeight,	// 输入图像高度
+	int32_t			nFrameRate,		// 编码帧率
+	float			nBitRateFactor)	// 转码因子，通常设为 0.8~8
+{
+	AVCodec* pVideoEncoder = nullptr;
+	int res = 0;
+	pVideoEncoder = avcodec_find_encoder(AV_CODEC_ID_H264);
+	if (pVideoEncoder == nullptr)
+	{
+		std::cout << "<VidEncoderOpen> [ERROR] fail to find AV_CODEC_ID_H264" << std::endl;
+		return -1;
+	}
 
+	m_pVideoEncCtx = avcodec_alloc_context3(pVideoEncoder);
 
+	if (m_pVideoEncCtx == nullptr)
+	{
+		std::cout << "VideoEncoderOpen> [ERROR] fail to find avcodec_alloc_context3" << std::endl;
+		return -2;
+	}
 
+	int64_t nBitRate = (((int64_t)nFrameWidth * nFrameHeight * 3 / 2) * nBitRateFactor);// 计算码率
+	m_pVideoEncCtx->codec_id = AV_CODEC_ID_H264;
+	m_pVideoEncCtx->pix_fmt = ePxlFormat;
+	m_pVideoEncCtx->width = nFrameWidth;
+	m_pVideoEncCtx->height = nFrameHeight;
+	m_pVideoEncCtx->bit_rate = nBitRate;
+	m_pVideoEncCtx->rc_buffer_size = static_cast<int>(nBitRate);
+	m_pVideoEncCtx->framerate.num = nFrameRate;	// 帧率
+	m_pVideoEncCtx->framerate.den = 1;
+	m_pVideoEncCtx->gop_size = nFrameRate;	// 每秒一个关键帧
+	m_pVideoEncCtx->time_base.num = 1;
+	m_pVideoEncCtx->time_base.den = nFrameRate * 1000;	// 时间基
+	m_pVideoEncCtx->has_b_frames = 0;
+	m_pVideoEncCtx->max_b_frames = 0;
+	m_pVideoEncCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+
+	res = avcodec_open2(m_pVideoEncCtx, pVideoEncoder, nullptr);
+	if (res < 0)
+	{
+		std::cout << "<VidEncoderOpen> [ERROR] fail to find avcodec_open2(), res=" << res << std::endl;
+		avcodec_free_context(&m_pVideoEncCtx);
+		return -3;
+	}
+	return 0;
+}
+
+// 关闭编码器
+void VidEncoderClose()
+{
+	if (m_pVideoEncCtx != nullptr)
+	{
+		avcodec_free_context(&m_pVideoEncCtx);
+		m_pVideoEncCtx = nullptr;
+	}
+}
+
+// 进行视频帧编码,注意不是每个输入视频帧编码就会有输出数据包
+int32_t VidEncoderEncPacket(AVFrame* pInFrame, AVPacket** ppOutPacket)
+{
+	AVPacket* pOutPacket = nullptr;
+	int res = 0;
+
+	if (m_pVideoEncCtx == nullptr)
+	{
+		std::cout << "<VidEncoderEncPacket> [ERROR] bad status" << std::endl;
+		return -1;
+	}
+
+	// 送入要编码的视频帧
+	res = avcodec_send_frame(m_pVideoEncCtx, pInFrame);
+	if (res == AVERROR(EAGAIN))
+	{
+		std::cout << "<VidEncoderEncPacket> avcodec_send_frame() EAGAIN" << std::endl;
+	}
+	else if (res == AVERROR_EOF)
+	{
+		std::cout << "<VidEncoderEncPacket> avcoder_send_frame() AVERROR_EOF" << std::endl;
+	}
+	else if (res < 0)
+	{
+		std::cout << "<VidEncoderEncPacket> [ERROR] fail to avcodec_send_frame" << std::endl;
+		return -2;
+	}
+
+	// 读取编码后的数据包
+	pOutPacket = av_packet_alloc();
+	res = avcodec_receive_packet(m_pVideoEncCtx, pOutPacket);
+	if (res == AVERROR(EAGAIN))	// 当前这次没有数据输出，但是后续可以继续读取
+	{
+		av_packet_free(&pOutPacket);
+		return EAGAIN;
+	}
+	else if (res == AVERROR_EOF)
+	{
+		std::cout << "<VidEncoderEncPacket> avcodec_receive_packet() EOF" << std::endl;
+		av_packet_free(&pOutPacket);
+		return AVERROR_EOF;
+	}
+	else if (res < 0)
+	{
+		std::cout << "<VidEncoderEncPacket> avcodec_receive_packet(), res=" << res << std::endl;
+		av_packet_free(&pOutPacket);
+		return res;
+	}
+
+	(*ppOutPacket) = pOutPacket;
+	return 0;
+}
 
 
 
